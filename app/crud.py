@@ -4,8 +4,8 @@ from sqlalchemy.orm import Session,joinedload
 from . import models, schemas
 from .security import get_password_hash
 from datetime import datetime, timedelta
-from .models import UserRole
-
+from .models import UserRole, SalesCaseStatus 
+from typing import Optional
 # --- CRUD para Users ---
 
 def get_user_by_email(db: Session, email: str):
@@ -199,4 +199,141 @@ def create_sales_case(db: Session, case_create: schemas.SalesCaseCreate):
         # 6. Se qualquer validação falhou, reverter TODAS as alterações
         db.rollback()
         # Re-levantar a exceção para que o endpoint a possa tratar
+        raise e
+    
+def get_sales_case(db: Session, case_id: int):
+    """
+    Busca um único estojo pelo seu ID, carregando de forma otimizada
+    os itens e os detalhes dos produtos associados.
+    """
+    return (
+        db.query(models.SalesCase)
+        .filter(models.SalesCase.id == case_id)
+        .options(
+            joinedload(models.SalesCase.items)
+            .joinedload(models.SalesCaseItem.product)
+        )
+        .first()
+    )
+
+def get_sales_cases(
+    db: Session, 
+    current_user: models.User, 
+    status: Optional[SalesCaseStatus] = None, 
+    sales_rep_id: Optional[int] = None
+):
+    """
+    Busca uma lista de estojos com base em filtros e permissões.
+    - ADMINS podem filtrar por qualquer vendedora.
+    - SALES_REPs veem apenas os seus próprios estojos.
+    """
+    query = db.query(models.SalesCase).order_by(models.SalesCase.id.desc())
+
+    # --- Lógica de Segurança e Filtragem ---
+    if current_user.role == UserRole.SALES_REP:
+        # Força o filtro para a própria vendedora, ignorando o query param
+        query = query.filter(models.SalesCase.sales_rep_id == current_user.id)
+    elif current_user.role == UserRole.ADMIN and sales_rep_id:
+        # Admin pode filtrar por uma vendedora específica
+        query = query.filter(models.SalesCase.sales_rep_id == sales_rep_id)
+
+    if status:
+        query = query.filter(models.SalesCase.status == status)
+    
+    return query.all()
+
+def process_sales_case_return(db: Session, case_id: int, return_request: schemas.SalesCaseReturnRequest, current_user: models.User):
+    """
+    Processa a devolução de um estojo. Operação transacional de missão crítica.
+    """
+    try:
+        # 1. Validação inicial do estojo
+        db_case = get_sales_case(db, case_id) # Reutilizamos a nossa função otimizada
+        if not db_case:
+            raise ValueError("Sales case not found.")
+        if db_case.status != SalesCaseStatus.ON_LOAN:
+            raise ValueError(f"Sales case is not in '{SalesCaseStatus.ON_LOAN.value}' status.")
+            
+        # 2. Validação de autorização
+        if current_user.role == UserRole.SALES_REP and db_case.sales_rep_id != current_user.id:
+            raise PermissionError("Not authorized to return this sales case.")
+
+        # 3. Preparar dados para processamento
+        loaned_items_map = {item.product_id: item.quantity for item in db_case.items}
+        items_sold_map = {item.product_id: item.quantity_sold for item in return_request.items_sold}
+        
+        items_summary_report = []
+        total_items_sold = 0
+        total_value_sold = 0.0
+
+        # 4. Processar cada produto que estava no estojo
+        for product_id, quantity_loaned in loaned_items_map.items():
+            quantity_sold = items_sold_map.get(product_id, 0)
+
+            if quantity_sold > quantity_loaned:
+                raise ValueError(f"Cannot sell more items than were loaned for product ID {product_id}.")
+
+            quantity_returned = quantity_loaned - quantity_sold
+            
+            # Atualizar o inventário do produto
+            product = db.query(models.Product).filter(models.Product.id == product_id).first()
+            if not product: # Sanity check
+                raise ValueError(f"Product with ID {product_id} from case seems to be missing.")
+            
+            product.on_loan_quantity -= quantity_loaned
+            # VIBECODER CORRECTION: A instrução original era "aumentar stock pelo retornado".
+            # A lógica correta é diminuir o stock físico total pelo que foi vendido.
+            product.stock_quantity -= quantity_sold 
+
+            # Construir o relatório de resumo
+            subtotal = quantity_sold * float(product.price)
+            items_summary_report.append(schemas.ItemReturnSummary(
+                product_name=product.name,
+                quantity_loaned=quantity_loaned,
+                quantity_sold=quantity_sold,
+                quantity_returned=quantity_returned,
+                price_per_item=float(product.price),
+                subtotal_sold=subtotal,
+            ))
+            total_items_sold += quantity_sold
+            total_value_sold += subtotal
+
+        # 5. Gerar o registo de venda (Order), se algo foi vendido
+        new_order_id = None
+        if total_items_sold > 0:
+            new_order = models.Order(user_id=db_case.sales_rep_id, status="completed_by_sales_rep")
+            db.add(new_order)
+            db.flush() # Para obter o new_order.id
+
+            for item in return_request.items_sold:
+                if item.quantity_sold > 0:
+                    product = db.query(models.Product).filter(models.Product.id == item.product_id).first()
+                    order_item = models.OrderItem(
+                        order_id=new_order.id,
+                        product_id=item.product_id,
+                        quantity=item.quantity_sold,
+                        price_at_purchase=product.price
+                    )
+                    db.add(order_item)
+            new_order_id = new_order.id
+
+        # 6. Finalizar o estojo
+        db_case.status = SalesCaseStatus.RETURNED
+        
+        # 7. Confirmar a transação
+        db.commit()
+
+        # 8. Construir e retornar o relatório final
+        return schemas.SalesCaseReturnReport(
+            case_id=case_id,
+            new_order_id=new_order_id,
+            sales_rep_id=db_case.sales_rep_id,
+            date_returned=datetime.utcnow(),
+            total_items_sold=total_items_sold,
+            total_value_sold=total_value_sold,
+            items_summary=items_summary_report
+        )
+
+    except (ValueError, PermissionError) as e:
+        db.rollback()
         raise e

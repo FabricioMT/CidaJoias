@@ -3,7 +3,7 @@ from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
-
+from typing import List
 # Importar nossos modelos e schemas
 from . import models, schemas, database, crud
 from .models import UserRole
@@ -67,19 +67,21 @@ async def get_current_admin_user(current_user: schemas.User = Depends(get_curren
         )
     return current_user
 
-def require_role(required_role: UserRole):
+def require_role(required_roles: List[UserRole]):
     """
-    Uma fábrica de dependências que cria uma dependência para um 'role' específico.
+    Uma fábrica de dependências que cria uma dependência que requer que o 
+    utilizador tenha um dos 'roles' especificados.
     """
     def role_checker(current_user: models.User = Depends(get_current_user)):
-        if current_user.role != required_role:
+        if current_user.role not in required_roles:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"User does not have the required '{required_role.value}' privilege"
+                detail=f"User does not have the required privileges. Allowed roles: {[role.value for role in required_roles]}"
             )
         return current_user
     return role_checker
 
 # Agora podemos criar dependências específicas e reutilizáveis
-require_admin_user = require_role(UserRole.ADMIN)
-require_sales_rep_user = require_role(UserRole.SALES_REP)
+require_admin_user = require_role([UserRole.ADMIN])
+require_sales_rep_user = require_role([UserRole.SALES_REP])
+require_admin_or_sales_rep = require_role([UserRole.ADMIN, UserRole.SALES_REP])

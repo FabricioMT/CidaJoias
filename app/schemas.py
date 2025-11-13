@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List
+from typing import List,Optional
 from datetime import datetime
 # Este será o "schema" que a API retornará ao listar produtos.
 # Note que ele NÃO é o modelo do SQLAlchemy, é um modelo Pydantic.
@@ -125,3 +125,28 @@ class SalesCaseCreate(BaseModel):
     sales_rep_id: int
     loan_duration_days: int = Field(..., gt=0, le=90, description="Duration in days (1-90)")
     items: List[SalesCaseItemCreate]
+
+class ItemSold(BaseModel):
+    product_id: int
+    quantity_sold: int = Field(..., ge=0) # Pode ser 0, mas não negativo
+
+class SalesCaseReturnRequest(BaseModel):
+    items_sold: List[ItemSold]
+
+# Output: O que a API devolve como relatório
+class ItemReturnSummary(BaseModel):
+    product_name: str
+    quantity_loaned: int
+    quantity_sold: int
+    quantity_returned: int
+    price_per_item: float
+    subtotal_sold: float
+
+class SalesCaseReturnReport(BaseModel):
+    case_id: int
+    new_order_id: Optional[int] = None # O ID da nova encomenda gerada, se houver
+    sales_rep_id: int
+    date_returned: datetime
+    total_items_sold: int
+    total_value_sold: float
+    items_summary: List[ItemReturnSummary]

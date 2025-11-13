@@ -2,10 +2,10 @@
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
-from typing import List
-
+from typing import List, Optional
 from .. import models, schemas, auth, crud
 from ..database import get_db
+from ..models import SalesCaseStatus,UserRole
 
 router = APIRouter(
     prefix="/sales-cases",
@@ -34,3 +34,57 @@ def create_new_sales_case(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e)
         )
+    
+@router.get("/", response_model=List[schemas.SalesCaseResponse])
+def read_sales_cases(
+    status: Optional[SalesCaseStatus] = None,
+    sales_rep_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.require_admin_or_sales_rep)
+):
+    """
+    Lista os estojos de vendas.
+    - ADMINS: Podem ver todos e filtrar por 'sales_rep_id'.
+    - SALES_REPS: Veem apenas os seus próprios estojos.
+    """
+    cases = crud.get_sales_cases(db, current_user, status=status, sales_rep_id=sales_rep_id)
+    return cases
+
+@router.get("/{case_id}", response_model=schemas.SalesCaseResponse)
+def read_sales_case(
+    case_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.require_admin_or_sales_rep)
+):
+    """
+    Obtém os detalhes de um estojo de vendas específico.
+    """
+    db_case = crud.get_sales_case(db, case_id=case_id)
+    
+    if db_case is None:
+        raise HTTPException(status_code=404, detail="Sales case not found")
+        
+    # --- Lógica de Autorização ---
+    if current_user.role == UserRole.SALES_REP and db_case.sales_rep_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to view this sales case")
+        
+    return db_case
+
+@router.post("/{case_id}/return", response_model=schemas.SalesCaseReturnReport)
+def return_sales_case(
+    case_id: int,
+    return_request: schemas.SalesCaseReturnRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.require_admin_or_sales_rep)
+):
+    """
+    Finaliza um estojo, processa as vendas e devolve o stock restante.
+    Esta é uma operação transacional de alta importância.
+    """
+    try:
+        report = crud.process_sales_case_return(db, case_id, return_request, current_user)
+        return report
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
